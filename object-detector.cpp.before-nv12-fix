@@ -1,0 +1,2801 @@
+/*
+ * ============================================================
+ * YOLO26 MERGED PIPELINE
+ * ============================================================
+ *
+ * Combines:
+ *   - File 1: snapshot capture + JSON detection events
+ *   - File 2: live annotated RTSP re-stream
+ *
+ * RTSP INPUT:
+ *   Read automatically from:
+ *   /var/lib/camera-discovery/cameras.json
+ *
+ * The rest of the pipeline behavior is unchanged.
+ *
+ * Pipeline:
+ *
+ *   nvurisrcbin -> streammux -> nvinfer -> nvdsosd -> tee
+ *        |                                             |-- queue -> fakesink
+ *        |                                             |-- queue -> nvvideoconvert ->
+ *        |                                             |            capsfilter -> nvjpegenc ->
+ *        |                                             |            appsink
+ *        |                                             |-- queue -> nvrtspoutsinkbin
+ *
+ * ============================================================
+ */
+
+#include <gst/gst.h>
+#include <gst/app/gstappsink.h>
+#include <glib.h>
+#include <glib-unix.h>
+
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <ctime>
+#include <csignal>
+#include <string>
+#include <map>
+#include <mutex>
+#include <vector>
+#include <cctype>
+#include <chrono>
+#include <algorithm>
+#include <unordered_map>
+#include <nlohmann/json.hpp>
+
+#include "gstnvdsmeta.h"
+#include "nvdsmeta.h"
+#include "nvbufsurface.h"
+#include <NvInfer.h>
+#include <cuda_runtime_api.h>
+#include <opencv2/opencv.hpp>
+#include <opencv2/dnn/dnn.hpp>
+
+using json = nlohmann::json;
+
+
+/*
+ * ============================================================
+ * Configuration
+ * ============================================================
+ */
+
+
+/* ============================================================
+ * best.engine crosswalk detector
+ * ============================================================ */
+
+static constexpr int BEST_INPUT_W = 640;
+static constexpr int BEST_INPUT_H = 640;
+static constexpr int BEST_NUM_CLASSES = 9;
+static constexpr int BEST_NUM_PREDICTIONS = 8400;
+static constexpr float BEST_CONF_THRESHOLD = 0.30f;
+static constexpr float BEST_NMS_THRESHOLD = 0.45f;
+static constexpr float BEST_LINE_POSITION = 0.85f;
+
+static const char *BEST_ENGINE_FILE =
+    "/opt/radian/ai/model/best.engine";
+
+static const char *BEST_INPUT_NAME = "images";
+static const char *BEST_OUTPUT_NAME = "output0";
+
+class BestEngineLogger : public nvinfer1::ILogger
+{
+public:
+    void log(
+        Severity severity,
+        const char *msg) noexcept override
+    {
+        if (severity <= Severity::kWARNING)
+        {
+            std::cerr
+                << "[BEST ENGINE] "
+                << msg
+                << std::endl;
+        }
+    }
+};
+
+static BestEngineLogger g_best_logger;
+
+class BestEngineDetector
+{
+public:
+    bool initialize();
+    bool detect(
+        const cv::Mat &frame,
+        cv::Rect &best_crosswalk);
+
+    ~BestEngineDetector();
+
+private:
+    nvinfer1::IRuntime *runtime_ = nullptr;
+    nvinfer1::ICudaEngine *engine_ = nullptr;
+    nvinfer1::IExecutionContext *context_ = nullptr;
+
+    void *gpu_input_ = nullptr;
+    void *gpu_output_ = nullptr;
+
+    cudaStream_t stream_ = nullptr;
+
+    std::vector<float> host_input_;
+    std::vector<float> host_output_;
+
+    bool initialized_ = false;
+};
+
+static BestEngineDetector g_best_detector;
+
+static bool g_crosswalk_line_valid = false;
+static int g_crosswalk_line_y = -1;
+
+static std::chrono::steady_clock::time_point
+    g_crosswalk_line_locked_until;
+
+static constexpr int CROSSWALK_LINE_LOCK_SECONDS = 120;
+
+
+/* ============================================================
+ * best.engine TensorRT initialization
+ * ============================================================ */
+
+bool BestEngineDetector::initialize()
+{
+    if (initialized_)
+        return true;
+
+    std::ifstream file(
+        BEST_ENGINE_FILE,
+        std::ios::binary);
+
+    if (!file)
+    {
+        std::cerr
+            << "[BEST ENGINE] Cannot open: "
+            << BEST_ENGINE_FILE
+            << std::endl;
+
+        return false;
+    }
+
+    file.seekg(
+        0,
+        std::ios::end);
+
+    const std::streamsize size =
+        file.tellg();
+
+    file.seekg(
+        0,
+        std::ios::beg);
+
+    std::vector<char> engine_data(
+        static_cast<size_t>(size));
+
+    if (!file.read(
+            engine_data.data(),
+            size))
+    {
+        std::cerr
+            << "[BEST ENGINE] Failed reading engine"
+            << std::endl;
+
+        return false;
+    }
+
+    runtime_ =
+        nvinfer1::createInferRuntime(
+            g_best_logger);
+
+    if (!runtime_)
+    {
+        std::cerr
+            << "[BEST ENGINE] createInferRuntime failed"
+            << std::endl;
+
+        return false;
+    }
+
+    engine_ =
+        runtime_->deserializeCudaEngine(
+            engine_data.data(),
+            engine_data.size());
+
+    if (!engine_)
+    {
+        std::cerr
+            << "[BEST ENGINE] deserializeCudaEngine failed"
+            << std::endl;
+
+        return false;
+    }
+
+    context_ =
+        engine_->createExecutionContext();
+
+    if (!context_)
+    {
+        std::cerr
+            << "[BEST ENGINE] createExecutionContext failed"
+            << std::endl;
+
+        return false;
+    }
+
+    nvinfer1::Dims4 input_dims(
+        1,
+        3,
+        BEST_INPUT_H,
+        BEST_INPUT_W);
+
+    if (!context_->setInputShape(
+            BEST_INPUT_NAME,
+            input_dims))
+    {
+        std::cerr
+            << "[BEST ENGINE] setInputShape failed"
+            << std::endl;
+        return false;
+    }
+
+    host_input_.resize(
+        1ULL *
+        3 *
+        BEST_INPUT_H *
+        BEST_INPUT_W);
+
+    host_output_.resize(
+        1ULL *
+        (4 + BEST_NUM_CLASSES) *
+        BEST_NUM_PREDICTIONS);
+
+    if (cudaMalloc(
+            &gpu_input_,
+            host_input_.size() *
+                sizeof(float)) != cudaSuccess)
+    {
+        std::cerr
+            << "[BEST ENGINE] cudaMalloc input failed"
+            << std::endl;
+
+        return false;
+    }
+
+    if (cudaMalloc(
+            &gpu_output_,
+            host_output_.size() *
+                sizeof(float)) != cudaSuccess)
+    {
+        std::cerr
+            << "[BEST ENGINE] cudaMalloc output failed"
+            << std::endl;
+
+        return false;
+    }
+
+    if (cudaStreamCreate(
+            &stream_) != cudaSuccess)
+    {
+        std::cerr
+            << "[BEST ENGINE] cudaStreamCreate failed"
+            << std::endl;
+
+        return false;
+    }
+
+    if (!context_->setTensorAddress(
+            BEST_INPUT_NAME,
+            gpu_input_))
+    {
+        std::cerr
+            << "[BEST ENGINE] input tensor address failed"
+            << std::endl;
+
+        return false;
+    }
+
+    if (!context_->setTensorAddress(
+            BEST_OUTPUT_NAME,
+            gpu_output_))
+    {
+        std::cerr
+            << "[BEST ENGINE] output tensor address failed"
+            << std::endl;
+
+        return false;
+    }
+
+    initialized_ = true;
+
+    std::cout
+        << "[BEST ENGINE] Ready: "
+        << BEST_ENGINE_FILE
+        << std::endl;
+
+    return true;
+}
+
+
+/* ============================================================
+ * best.engine inference
+ * ============================================================ */
+
+bool BestEngineDetector::detect(
+    const cv::Mat &frame,
+    cv::Rect &best_crosswalk)
+{
+    if (!initialized_ ||
+        frame.empty())
+    {
+        return false;
+    }
+
+    float scale =
+        std::min(
+            static_cast<float>(BEST_INPUT_W) /
+                static_cast<float>(frame.cols),
+            static_cast<float>(BEST_INPUT_H) /
+                static_cast<float>(frame.rows));
+
+    int resized_w =
+        static_cast<int>(
+            frame.cols * scale);
+
+    int resized_h =
+        static_cast<int>(
+            frame.rows * scale);
+
+    int pad_x =
+        (BEST_INPUT_W - resized_w) / 2;
+
+    int pad_y =
+        (BEST_INPUT_H - resized_h) / 2;
+
+    cv::Mat resized;
+
+    cv::resize(
+        frame,
+        resized,
+        cv::Size(
+            resized_w,
+            resized_h));
+
+    cv::Mat letterbox(
+        BEST_INPUT_H,
+        BEST_INPUT_W,
+        CV_8UC3,
+        cv::Scalar(
+            114,
+            114,
+            114));
+
+    resized.copyTo(
+        letterbox(
+            cv::Rect(
+                pad_x,
+                pad_y,
+                resized_w,
+                resized_h)));
+
+    cv::Mat rgb;
+
+    cv::cvtColor(
+        letterbox,
+        rgb,
+        cv::COLOR_BGR2RGB);
+
+    size_t channel_size =
+        static_cast<size_t>(
+            BEST_INPUT_W) *
+        BEST_INPUT_H;
+
+    for (int y = 0; y < BEST_INPUT_H; ++y)
+    {
+        const cv::Vec3b *row =
+            rgb.ptr<cv::Vec3b>(y);
+
+        for (int x = 0; x < BEST_INPUT_W; ++x)
+        {
+            const cv::Vec3b &pixel =
+                row[x];
+
+            size_t index =
+                static_cast<size_t>(y) *
+                    BEST_INPUT_W +
+                x;
+
+            host_input_[index] =
+                pixel[0] / 255.0f;
+
+            host_input_[
+                channel_size + index] =
+                pixel[1] / 255.0f;
+
+            host_input_[
+                2 * channel_size + index] =
+                pixel[2] / 255.0f;
+        }
+    }
+
+    if (cudaMemcpyAsync(
+            gpu_input_,
+            host_input_.data(),
+            host_input_.size() *
+                sizeof(float),
+            cudaMemcpyHostToDevice,
+            stream_) != cudaSuccess)
+    {
+        return false;
+    }
+
+    if (!context_->enqueueV3(
+            stream_))
+    {
+        std::cerr
+            << "[BEST ENGINE] enqueueV3 failed"
+            << std::endl;
+
+        return false;
+    }
+
+    if (cudaMemcpyAsync(
+            host_output_.data(),
+            gpu_output_,
+            host_output_.size() *
+                sizeof(float),
+            cudaMemcpyDeviceToHost,
+            stream_) != cudaSuccess)
+    {
+        return false;
+    }
+
+    if (cudaStreamSynchronize(
+            stream_) != cudaSuccess)
+    {
+        return false;
+    }
+
+    std::vector<cv::Rect> boxes;
+    std::vector<float> confidences;
+    float max_crosswalk_score = 0.0f;
+
+    for (int i = 0;
+         i < BEST_NUM_PREDICTIONS;
+         ++i)
+    {
+        float cx =
+            host_output_[i];
+
+        float cy =
+            host_output_[
+                BEST_NUM_PREDICTIONS + i];
+
+        float w =
+            host_output_[
+                2 * BEST_NUM_PREDICTIONS + i];
+
+        float h =
+            host_output_[
+                3 * BEST_NUM_PREDICTIONS + i];
+
+        float best_score = 0.0f;
+        int best_class = -1;
+
+        for (int c = 0;
+             c < BEST_NUM_CLASSES;
+             ++c)
+        {
+            float score =
+                host_output_[
+                    (4 + c) *
+                        BEST_NUM_PREDICTIONS +
+                    i];
+
+            if (score > best_score)
+            {
+                best_score = score;
+                best_class = c;
+            }
+        }
+        float crosswalk_score = host_output_[4 * BEST_NUM_PREDICTIONS + i];
+        if (crosswalk_score > max_crosswalk_score)
+        {
+            max_crosswalk_score = crosswalk_score;
+        }
+
+        if (best_class == 4 && best_score >= 0.10f) {
+            std::cout << "[BEST DEBUG] CROSSWALK CANDIDATE score="
+                      << best_score << std::endl;
+        }
+        /* Class 4 = Crosswalk */
+        if (best_class != 4 ||
+            best_score <
+                BEST_CONF_THRESHOLD)
+        {
+            continue;
+        }
+
+        float x =
+            cx -
+            w / 2.0f;
+
+        float y =
+            cy -
+            h / 2.0f;
+
+        x =
+            (x - pad_x) /
+            scale;
+
+        y =
+            (y - pad_y) /
+            scale;
+
+        w /= scale;
+        h /= scale;
+
+        cv::Rect box(
+            static_cast<int>(x),
+            static_cast<int>(y),
+            static_cast<int>(w),
+            static_cast<int>(h));
+
+        box &=
+            cv::Rect(
+                0,
+                0,
+                frame.cols,
+                frame.rows);
+
+        if (box.width > 0 &&
+            box.height > 0)
+        {
+            boxes.push_back(box);
+            confidences.push_back(
+                best_score);
+        }
+    }
+
+    std::cout << "[BEST DEBUG] MAX CROSSWALK SCORE="
+              << max_crosswalk_score << std::endl;
+
+    if (boxes.empty())
+        return false;
+
+    std::vector<int> indices;
+
+    cv::dnn::NMSBoxes(
+        boxes,
+        confidences,
+        BEST_CONF_THRESHOLD,
+        BEST_NMS_THRESHOLD,
+        indices);
+
+    if (indices.empty())
+        return false;
+
+    int best_index =
+        indices[0];
+
+    int best_area =
+        boxes[best_index].area();
+
+    for (size_t i = 1;
+         i < indices.size();
+         ++i)
+    {
+        int idx =
+            indices[i];
+
+        if (boxes[idx].area() >
+            best_area)
+        {
+            best_area =
+                boxes[idx].area();
+
+            best_index =
+                idx;
+        }
+    }
+
+    best_crosswalk =
+        boxes[best_index];
+
+    return true;
+}
+
+
+BestEngineDetector::~BestEngineDetector()
+{
+    if (stream_)
+        cudaStreamDestroy(stream_);
+
+    if (gpu_input_)
+        cudaFree(gpu_input_);
+
+    if (gpu_output_)
+        cudaFree(gpu_output_);
+
+    if (context_)
+        delete context_;
+
+    if (engine_)
+        delete engine_;
+
+    if (runtime_)
+        delete runtime_;
+}
+
+#define SNAPSHOT_DIR              "/root/video_recorder/snapshots"
+#define EVENT_DIR                 "/root/video_recorder/events/pending"
+#define DEEPSTREAM_CONFIG         "/opt/radian/ai/config/config_infer_primary_yolo26.txt"
+#define SNAPSHOT_COOLDOWN_SECONDS 5
+#define RTSP_OUTPUT_URL_HINT      "rtsp://192.168.1.155:8554/ai"
+
+/* Red-light violation configuration */
+#define GREEN_DURATION_SECONDS    50
+#define RED_DURATION_SECONDS      30
+#define VIOLATION_LINE_PERCENT    0.70
+
+/* Camera discovery output */
+#define CAMERA_JSON_FILE          "/var/lib/camera-discovery/cameras.json"
+
+
+/*
+ * ============================================================
+ * Shared state — touched from multiple threads, hence mutex.
+ * ============================================================
+ */
+
+struct SnapshotData
+{
+    std::vector<unsigned char> jpeg_data;
+    bool valid = false;
+};
+
+static SnapshotData latest_snapshot;
+static std::mutex snapshot_mutex;
+static std::map<std::string, time_t> last_snapshot_time;
+
+static GMainLoop *main_loop = nullptr;
+
+/* ============================================================
+ * Crosswalk virtual line state
+ * ============================================================ */
+static bool crosswalk_line_locked = false;
+static int crosswalk_line_y = -1;
+static std::chrono::steady_clock::time_point next_crosswalk_line_check =
+    std::chrono::steady_clock::now();
+static constexpr int CROSSWALK_LINE_CHECK_SECONDS = 60;
+static constexpr float CROSSWALK_LINE_POSITION = 0.85f;
+
+
+/* Dummy traffic signal state */
+static const auto signal_start_time =
+    std::chrono::steady_clock::now();
+
+enum class TrafficSignalState
+{
+    GREEN,
+    RED
+};
+
+static TrafficSignalState get_traffic_signal_state()
+{
+    auto now = std::chrono::steady_clock::now();
+
+    auto elapsed =
+        std::chrono::duration_cast<
+            std::chrono::seconds>(
+                now - signal_start_time)
+        .count();
+
+    const long cycle =
+        GREEN_DURATION_SECONDS +
+        RED_DURATION_SECONDS;
+
+    const long position =
+        elapsed % cycle;
+
+    if (position < GREEN_DURATION_SECONDS)
+        return TrafficSignalState::GREEN;
+
+    return TrafficSignalState::RED;
+}
+
+/*
+ * ============================================================
+ * Dynamic violation line
+ * ============================================================
+ */
+
+static int get_violation_line_y(int frame_height)
+{
+    return static_cast<int>(
+        frame_height * VIOLATION_LINE_PERCENT);
+}
+
+/*
+ * ============================================================
+ * Read RTSP URL from camera-discovery JSON
+ * ============================================================
+ *
+ * Expected JSON:
+ *
+ * {
+ *     "version": 1,
+ *     "updated_at": "...",
+ *     "cameras": [
+ *         {
+ *             "id": "camera_001",
+ *             "mac": "...",
+ *             "ip": "10.10.10.156",
+ *             "status": "online",
+ *             "rtsp": {
+ *                 "valid": true,
+ *                 "url": "rtsp://..."
+ *             }
+ *         }
+ *     ]
+ * }
+ *
+ * The first camera that is:
+ *
+ *     status = online
+ *     rtsp.valid = true
+ *
+ * will be selected.
+ *
+ * ============================================================
+ */
+
+static std::string get_rtsp_url_from_json()
+{
+    std::ifstream file(CAMERA_JSON_FILE);
+
+    if (!file.is_open())
+    {
+        std::cerr << "ERROR: Cannot open camera JSON file: "
+                  << CAMERA_JSON_FILE << std::endl;
+
+        return "";
+    }
+
+    try
+    {
+        json data;
+        file >> data;
+
+        if (!data.contains("cameras") ||
+            !data["cameras"].is_array())
+        {
+            std::cerr << "ERROR: Invalid camera JSON: "
+                      << "'cameras' array not found."
+                      << std::endl;
+
+            return "";
+        }
+
+        for (const auto &camera : data["cameras"])
+        {
+            /*
+             * Check camera status
+             */
+            if (!camera.contains("status") ||
+                camera["status"] != "online")
+            {
+                continue;
+            }
+
+            /*
+             * Check RTSP section
+             */
+            if (!camera.contains("rtsp") ||
+                !camera["rtsp"].is_object())
+            {
+                continue;
+            }
+
+            /*
+             * Check RTSP validity
+             */
+            if (!camera["rtsp"].contains("valid") ||
+                !camera["rtsp"]["valid"].get<bool>())
+            {
+                continue;
+            }
+
+            /*
+             * Check RTSP URL
+             */
+            if (!camera["rtsp"].contains("url") ||
+                !camera["rtsp"]["url"].is_string())
+            {
+                continue;
+            }
+
+            std::string camera_id =
+                camera.value("id", "unknown");
+
+            std::string rtsp_url =
+                camera["rtsp"]["url"].get<std::string>();
+
+            if (rtsp_url.empty())
+            {
+                continue;
+            }
+
+            std::cout << "========================================"
+                      << std::endl;
+
+            std::cout << "Camera ID : "
+                      << camera_id
+                      << std::endl;
+
+            std::cout << "Camera IP : "
+                      << camera.value("ip", "unknown")
+                      << std::endl;
+
+            std::cout << "RTSP URL  : "
+                      << rtsp_url
+                      << std::endl;
+
+            std::cout << "========================================"
+                      << std::endl;
+
+            return rtsp_url;
+        }
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "ERROR: Failed to parse "
+                  << CAMERA_JSON_FILE
+                  << ": "
+                  << e.what()
+                  << std::endl;
+
+        return "";
+    }
+
+    std::cerr << "ERROR: No valid online camera found in "
+              << CAMERA_JSON_FILE
+              << std::endl;
+
+    return "";
+}
+
+
+/*
+ * ============================================================
+ * Small helpers
+ * ============================================================
+ */
+
+static std::string get_timestamp()
+{
+    std::time_t now = std::time(nullptr);
+    std::tm tm_now;
+    gmtime_r(&now, &tm_now);
+
+    std::ostringstream oss;
+    oss << std::put_time(&tm_now, "%Y-%m-%dT%H:%M:%S");
+
+    return oss.str();
+}
+
+
+static bool save_jpeg_data(
+    const std::vector<unsigned char> &data,
+    const std::string &filename)
+{
+    if (data.empty())
+    {
+        g_printerr("JPEG data is empty\n");
+        return false;
+    }
+
+    std::ofstream file(filename, std::ios::binary);
+
+    if (!file)
+    {
+        g_printerr(
+            "Failed to open snapshot file: %s\n",
+            filename.c_str());
+
+        return false;
+    }
+
+    file.write(
+        reinterpret_cast<const char *>(data.data()),
+        static_cast<std::streamsize>(data.size()));
+
+    file.close();
+
+    if (!file)
+    {
+        g_printerr(
+            "Failed while writing snapshot: %s\n",
+            filename.c_str());
+
+        return false;
+    }
+
+    return true;
+}
+
+
+static std::string safe_filename_component(
+    const std::string &value)
+{
+    std::string result;
+
+    for (char c : value)
+    {
+        unsigned char uc =
+            static_cast<unsigned char>(c);
+
+        result +=
+            (std::isalnum(uc) ||
+             c == '_' ||
+             c == '-') ? c : '_';
+    }
+
+    if (result.empty())
+        result = "object";
+
+    return result;
+}
+
+
+static std::string get_snapshot_category(
+    const std::string &object_name)
+{
+    static const std::map<std::string, std::string>
+        category_map = {
+
+        {"bicycle", "vehicles"},
+        {"car", "vehicles"},
+        {"motorcycle", "vehicles"},
+        {"bus", "vehicles"},
+        {"train", "vehicles"},
+        {"truck", "vehicles"},
+
+        {"person", "people"},
+
+        {"bird", "animals"},
+        {"cat", "animals"},
+        {"dog", "animals"},
+        {"horse", "animals"},
+        {"sheep", "animals"},
+        {"cow", "animals"},
+        {"elephant", "animals"},
+        {"bear", "animals"},
+        {"zebra", "animals"},
+        {"giraffe", "animals"},
+
+        {"cell phone", "electronics"},
+        {"laptop", "electronics"},
+        {"tv", "electronics"},
+        {"keyboard", "electronics"},
+        {"mouse", "electronics"},
+        {"remote", "electronics"},
+    };
+
+    auto it = category_map.find(object_name);
+
+    return (it != category_map.end())
+        ? it->second
+        : "other";
+}
+
+
+static std::string json_escape(
+    const std::string &value)
+{
+    std::string result;
+
+    for (char c : value)
+    {
+        switch (c)
+        {
+            case '\\':
+                result += "\\\\";
+                break;
+
+            case '"':
+                result += "\\\"";
+                break;
+
+            case '\n':
+                result += "\\n";
+                break;
+
+            case '\r':
+                result += "\\r";
+                break;
+
+            case '\t':
+                result += "\\t";
+                break;
+
+            default:
+                result += c;
+                break;
+        }
+    }
+
+    return result;
+}
+
+
+static bool save_detection_event(
+    const std::string &object_name,
+    float confidence,
+    std::time_t detection_time,
+    const std::string &timestamp,
+    const std::string &snapshot_path)
+{
+    std::ostringstream filename;
+
+    filename << EVENT_DIR << "/"
+             << safe_filename_component(object_name)
+             << "_"
+             << timestamp
+             << ".json";
+
+    std::ofstream file(filename.str());
+
+    if (!file)
+    {
+        g_printerr(
+            "Failed to create detection event: %s\n",
+            filename.str().c_str());
+
+        return false;
+    }
+
+    file << "{\n"
+         << "  \"object\": \""
+         << json_escape(object_name)
+         << "\",\n"
+
+         << "  \"confidence\": "
+         << std::fixed
+         << std::setprecision(4)
+         << confidence
+         << ",\n"
+
+         << "  \"timestamp\": \""
+         << timestamp
+         << "\",\n"
+
+         << "  \"unix_timestamp\": "
+         << static_cast<long long>(detection_time)
+         << ",\n"
+
+         << "  \"snapshot\": \""
+         << json_escape(snapshot_path)
+         << "\"\n"
+
+         << "}\n";
+
+    file.close();
+
+    if (!file)
+    {
+        g_printerr(
+            "Failed while writing detection event: %s\n",
+            filename.str().c_str());
+
+        return false;
+    }
+
+    g_print(
+        "EVENT SAVED: %s\n",
+        filename.str().c_str());
+
+    return true;
+}
+
+
+static void save_snapshot_for_object(
+    const std::string &object_name,
+    float confidence)
+{
+    std::time_t now = std::time(nullptr);
+
+    std::vector<unsigned char> jpeg_data;
+
+    /*
+     * Cooldown check + grab latest frame
+     */
+    {
+        std::lock_guard<std::mutex>
+            lock(snapshot_mutex);
+
+        auto it =
+            last_snapshot_time.find(object_name);
+
+        if (it != last_snapshot_time.end() &&
+            difftime(
+                now,
+                it->second)
+                < SNAPSHOT_COOLDOWN_SECONDS)
+        {
+            return;
+        }
+
+        last_snapshot_time[object_name] = now;
+
+        if (!latest_snapshot.valid ||
+            latest_snapshot.jpeg_data.empty())
+        {
+            g_printerr(
+                "No JPEG frame available for snapshot\n");
+
+            return;
+        }
+
+        jpeg_data =
+            latest_snapshot.jpeg_data;
+    }
+
+    std::string timestamp =
+        get_timestamp();
+
+    std::string category =
+        get_snapshot_category(object_name);
+
+    std::string category_dir =
+        std::string(SNAPSHOT_DIR)
+        + "/"
+        + category;
+
+    if (g_mkdir_with_parents(
+            category_dir.c_str(),
+            0755) != 0)
+    {
+        g_printerr(
+            "Failed to create snapshot category directory: %s\n",
+            category_dir.c_str());
+
+        return;
+    }
+
+    std::ostringstream filename;
+
+    filename << category_dir
+             << "/"
+             << safe_filename_component(object_name)
+             << "_"
+             << std::fixed
+             << std::setprecision(2)
+             << confidence
+             << "_"
+             << timestamp
+             << ".jpg";
+
+    if (save_jpeg_data(
+            jpeg_data,
+            filename.str()))
+    {
+        g_print(
+            "SNAPSHOT SAVED: %s\n",
+            filename.str().c_str());
+
+        save_detection_event(
+            object_name,
+            confidence,
+            now,
+            timestamp,
+            filename.str());
+    }
+}
+
+
+/*
+ * ============================================================
+ * appsink callback
+ * ============================================================
+ */
+
+static GstFlowReturn on_new_sample(
+    GstAppSink *appsink,
+    gpointer)
+{
+    GstSample *sample =
+        gst_app_sink_pull_sample(appsink);
+
+    if (!sample)
+        return GST_FLOW_ERROR;
+
+    GstBuffer *buffer =
+        gst_sample_get_buffer(sample);
+
+    if (!buffer)
+    {
+        gst_sample_unref(sample);
+        return GST_FLOW_OK;
+    }
+
+    GstMapInfo map;
+
+    if (gst_buffer_map(
+            buffer,
+            &map,
+            GST_MAP_READ))
+    {
+        std::vector<unsigned char> jpeg(
+            map.data,
+            map.data + map.size);
+
+        {
+            std::lock_guard<std::mutex>
+                lock(snapshot_mutex);
+
+            latest_snapshot.jpeg_data =
+                jpeg;
+
+            latest_snapshot.valid =
+                true;
+        }
+
+        gst_buffer_unmap(
+            buffer,
+            &map);
+    }
+
+    gst_sample_unref(sample);
+
+    return GST_FLOW_OK;
+}
+
+
+/*
+ * ============================================================
+ * Detection probe
+ * ============================================================
+ */
+
+
+/*
+ * ============================================================
+ * Stage 1: best.engine Crosswalk detection
+ *
+ * Runs before nvdsosd so the virtual line is rendered by OSD.
+ * Existing infer_src_probe() remains untouched.
+ * ============================================================
+ */
+
+static GstPadProbeReturn crosswalk_best_engine_probe(
+    GstPad *,
+    GstPadProbeInfo *info,
+    gpointer)
+{
+    GstBuffer *buf =
+        GST_PAD_PROBE_INFO_BUFFER(info);
+
+    if (!buf)
+        return GST_PAD_PROBE_OK;
+
+    NvDsBatchMeta *batch_meta =
+        gst_buffer_get_nvds_batch_meta(buf);
+
+    if (!batch_meta)
+        return GST_PAD_PROBE_OK;
+
+    auto now =
+        std::chrono::steady_clock::now();
+
+    /*
+     * Only run best.engine when a new Crosswalk check
+     * is required. While the 120-second lock is active,
+     * no TensorRT inference is performed.
+     */
+    bool detection_due =
+        !crosswalk_line_locked ||
+        now >= next_crosswalk_line_check;
+
+    if (detection_due)
+    {
+        bool crosswalk_found = false;
+        cv::Rect best_crosswalk;
+        float best_area = 0.0f;
+
+        for (
+            NvDsMetaList *l_frame =
+                batch_meta->frame_meta_list;
+            l_frame;
+            l_frame = l_frame->next)
+        {
+            auto *frame_meta =
+                static_cast<NvDsFrameMeta *>(
+                    l_frame->data);
+
+            if (!frame_meta)
+                continue;
+
+            guint batch_id =
+                frame_meta->batch_id;
+
+            NvBufSurface *surface = nullptr;
+
+            GstMapInfo map_info{};
+
+            if (!gst_buffer_map(
+                    buf,
+                    &map_info,
+                    GST_MAP_READ))
+            {
+                std::cerr
+                    << "[BEST ENGINE] "
+                       "Failed to map GstBuffer."
+                    << std::endl;
+                continue;
+            }
+
+            surface =
+                reinterpret_cast<NvBufSurface *>(
+                    map_info.data);
+
+            if (!surface ||
+                batch_id >= surface->numFilled)
+            {
+                gst_buffer_unmap(
+                    buf,
+                    &map_info);
+                continue;
+            }
+
+            NvBufSurfaceParams &params =
+                surface->surfaceList[batch_id];
+
+            int width =
+                static_cast<int>(params.width);
+
+            int height =
+                static_cast<int>(params.height);
+
+            cv::Mat frame_bgr;
+
+            static bool best_surface_debug_printed = false;
+            if (!best_surface_debug_printed)
+            {
+                std::cout << "[BEST SURFACE] width=" << width
+                          << " height=" << height
+                          << " colorFormat=" << params.colorFormat
+                          << " pitch=" << params.pitch
+                          << std::endl;
+                best_surface_debug_printed = true;
+            }
+
+            /*
+             * DeepStream normally delivers NV12 into
+             * nvdsosd for this pipeline. Handle RGBA too.
+             */
+            if (params.colorFormat ==
+                NVBUF_COLOR_FORMAT_RGBA)
+            {
+                if (NvBufSurfaceMap(
+                        surface,
+                        batch_id,
+                        0,
+                        NVBUF_MAP_READ) != 0)
+                {
+                    gst_buffer_unmap(
+                        buf,
+                        &map_info);
+                    continue;
+                }
+
+                NvBufSurfaceSyncForCpu(
+                    surface,
+                    batch_id,
+                    0);
+
+                cv::Mat rgba(
+                    height,
+                    width,
+                    CV_8UC4,
+                    surface->surfaceList[
+                        batch_id].mappedAddr.addr[0],
+                    surface->surfaceList[
+                        batch_id].pitch);
+
+                cv::cvtColor(
+                    rgba,
+                    frame_bgr,
+                    cv::COLOR_RGBA2BGR);
+
+                NvBufSurfaceUnMap(
+                    surface,
+                    batch_id,
+                    0);
+            }
+            else
+            {
+                /*
+                 * NV12 path.
+                 */
+                if (NvBufSurfaceMap(
+                        surface,
+                        batch_id,
+                        0,
+                        NVBUF_MAP_READ) != 0)
+                {
+                    gst_buffer_unmap(
+                        buf,
+                        &map_info);
+                    continue;
+                }
+
+                if (NvBufSurfaceMap(
+                        surface,
+                        batch_id,
+                        1,
+                        NVBUF_MAP_READ) != 0)
+                {
+                    NvBufSurfaceUnMap(
+                        surface,
+                        batch_id,
+                        0);
+
+                    gst_buffer_unmap(
+                        buf,
+                        &map_info);
+                    continue;
+                }
+
+                NvBufSurfaceSyncForCpu(
+                    surface,
+                    batch_id,
+                    0);
+
+                NvBufSurfaceSyncForCpu(
+                    surface,
+                    batch_id,
+                    1);
+
+                cv::Mat y_plane(
+                    height,
+                    width,
+                    CV_8UC1,
+                    surface->surfaceList[
+                        batch_id].mappedAddr.addr[0],
+                    surface->surfaceList[
+                        batch_id].pitch);
+
+                cv::Mat uv_plane(
+                    height / 2,
+                    width / 2,
+                    CV_8UC2,
+                    surface->surfaceList[
+                        batch_id].mappedAddr.addr[1],
+                    surface->surfaceList[
+                        batch_id].planeParams.pitch[1]);
+
+                cv::cvtColorTwoPlane(
+                    y_plane,
+                    uv_plane,
+                    frame_bgr,
+                    cv::COLOR_YUV2BGR_NV12);
+
+                NvBufSurfaceUnMap(
+                    surface,
+                    batch_id,
+                    1);
+
+                NvBufSurfaceUnMap(
+                    surface,
+                    batch_id,
+                    0);
+            }
+
+            gst_buffer_unmap(
+                buf,
+                &map_info);
+
+            if (frame_bgr.empty())
+            {
+                continue;
+            }
+            static bool best_frame_saved = false;
+            if (!best_frame_saved)
+            {
+                std::ofstream ppm("/tmp/best_engine_input.ppm", std::ios::binary);
+                if (ppm)
+                {
+                    cv::Mat rgb;
+                    cv::cvtColor(frame_bgr, rgb, cv::COLOR_BGR2RGB);
+                    ppm << "P6\n"
+                        << rgb.cols << " " << rgb.rows << "\n"
+                        << "255\n";
+                    ppm.write(
+                        reinterpret_cast<const char *>(rgb.data),
+                        static_cast<std::streamsize>(rgb.total() * rgb.elemSize()));
+                    ppm.close();
+                    std::cout << "[BEST SURFACE] Saved /tmp/best_engine_input.ppm" << std::endl;
+                }
+                else
+                {
+                    std::cerr << "[BEST SURFACE] Failed to open PPM file" << std::endl;
+                }
+                best_frame_saved = true;
+            }
+
+            /*
+             * best.engine:
+             * 640x640 input, Crosswalk = class 4.
+             *
+             * detect() performs:
+             *   letterbox
+             *   RGB conversion
+             *   TensorRT inference
+             *   decode
+             *   NMS
+             *   mapping back to original frame.
+             */
+            cv::Rect crosswalk_box;
+
+            if (g_best_detector.detect(
+                    frame_bgr,
+                    crosswalk_box))
+            {
+                float area =
+                    static_cast<float>(
+                        crosswalk_box.area());
+
+                if (area > best_area)
+                {
+                    best_area = area;
+                    best_crosswalk =
+                        crosswalk_box;
+                    crosswalk_found = true;
+                }
+            }
+        }
+
+        /*
+         * A check has now been performed.
+         *
+         * If Crosswalk was found:
+         *     update the line.
+         *
+         * If Crosswalk was NOT found:
+         *     retain the previous line.
+         *
+         * In both cases wait another 120 seconds
+         * before performing another best.engine check.
+         */
+        if (crosswalk_found)
+        {
+            int new_line_y =
+                best_crosswalk.y +
+                static_cast<int>(
+                    best_crosswalk.height *
+                    CROSSWALK_LINE_POSITION);
+
+            int frame_height = 1080;
+
+            if (batch_meta->frame_meta_list)
+            {
+                auto *frame_meta =
+                    static_cast<NvDsFrameMeta *>(
+                        batch_meta->frame_meta_list->data);
+
+                if (frame_meta &&
+                    frame_meta->source_frame_height > 0)
+                {
+                    frame_height =
+                        frame_meta->source_frame_height;
+                }
+            }
+
+            new_line_y =
+                std::max(
+                    0,
+                    std::min(
+                        frame_height - 1,
+                        new_line_y));
+
+            crosswalk_line_y =
+                new_line_y;
+
+            crosswalk_line_locked =
+                true;
+
+            std::cout
+                << "[BEST ENGINE] Crosswalk found. "
+                   "New line Y="
+                << crosswalk_line_y
+                << " locked for 120 seconds."
+                << std::endl;
+        }
+        else
+        {
+            if (crosswalk_line_locked)
+            {
+                std::cout
+                    << "[BEST ENGINE] Crosswalk not "
+                       "found during recheck. "
+                       "Keeping previous line Y="
+                    << crosswalk_line_y
+                    << std::endl;
+            }
+            else
+            {
+                std::cout
+                    << "[BEST ENGINE] Crosswalk not "
+                       "found. No virtual line yet."
+                    << std::endl;
+            }
+        }
+
+        next_crosswalk_line_check =
+            now +
+            std::chrono::seconds(
+                CROSSWALK_LINE_CHECK_SECONDS);
+    }
+
+    /*
+     * Add the line BEFORE nvdsosd processes the buffer.
+     * Therefore nvdsosd renders it into the existing
+     * output stream.
+     */
+    if (crosswalk_line_locked)
+    {
+        for (
+            NvDsMetaList *l_frame =
+                batch_meta->frame_meta_list;
+            l_frame;
+            l_frame = l_frame->next)
+        {
+            auto *frame_meta =
+                static_cast<NvDsFrameMeta *>(
+                    l_frame->data);
+
+            if (!frame_meta)
+                continue;
+
+            NvDsDisplayMeta *display_meta =
+                nvds_acquire_display_meta_from_pool(
+                    batch_meta);
+
+            if (!display_meta)
+                continue;
+
+            display_meta->num_lines = 1;
+
+            NvOSD_LineParams &line =
+                display_meta->line_params[0];
+
+            line.x1 = 0;
+            line.y1 = crosswalk_line_y;
+
+            line.x2 =
+                frame_meta->source_frame_width;
+
+            line.y2 =
+                crosswalk_line_y;
+
+            line.line_width = 5;
+
+            line.line_color.red = 1.0;
+            line.line_color.green = 0.0;
+            line.line_color.blue = 0.0;
+            line.line_color.alpha = 1.0;
+
+            nvds_add_display_meta_to_frame(
+                frame_meta,
+                display_meta);
+        }
+    }
+
+    return GST_PAD_PROBE_OK;
+}
+
+
+static GstPadProbeReturn infer_src_probe(
+    GstPad *,
+    GstPadProbeInfo *info,
+    gpointer)
+{
+    std::cout << "INFER_PROBE_CALLED" << std::endl;
+    GstBuffer *buf =
+        GST_PAD_PROBE_INFO_BUFFER(info);
+
+    if (!buf)
+        return GST_PAD_PROBE_OK;
+
+    NvDsBatchMeta *batch_meta =
+        gst_buffer_get_nvds_batch_meta(buf);
+
+    if (!batch_meta)
+    {
+        std::cout << "NO_BATCH_META" << std::endl;
+        return GST_PAD_PROBE_OK;
+    }
+
+    std::cout
+        << "BATCH_META_OK frames="
+        << g_list_length(batch_meta->frame_meta_list)
+        << std::endl;
+
+    for (
+        NvDsMetaList *l_frame =
+            batch_meta->frame_meta_list;
+        l_frame;
+        l_frame = l_frame->next)
+    {
+        auto *frame_meta =
+            static_cast<NvDsFrameMeta *>(
+                l_frame->data);
+
+        if (!frame_meta)
+            continue;
+
+        /* Crosswalk detection state for this frame */
+        bool crosswalk_found = false;
+        float crosswalk_y = 0.0f;
+        float crosswalk_h = 0.0f;
+
+        for (
+            NvDsMetaList *l_obj =
+                frame_meta->obj_meta_list;
+            l_obj;
+            l_obj = l_obj->next)
+        {
+            auto *obj_meta =
+                static_cast<NvDsObjectMeta *>(
+                    l_obj->data);
+
+            if (!obj_meta)
+                continue;
+
+            std::string object_name =
+                obj_meta->obj_label;
+
+            /* Detect Crosswalk */
+            if (object_name == "Crosswalk")
+            {
+                crosswalk_found = true;
+                crosswalk_y = obj_meta->rect_params.top;
+                crosswalk_h = obj_meta->rect_params.height;
+            }
+
+            float confidence =
+                obj_meta->confidence;
+
+            std::cout
+                << "DETECTED: "
+                << object_name
+                << " confidence="
+                << confidence
+                << " object_id="
+                << obj_meta->object_id
+                << " x="
+                << obj_meta->rect_params.left
+                << " y="
+                << obj_meta->rect_params.top
+                << " width="
+                << obj_meta->rect_params.width
+                << " height="
+                << obj_meta->rect_params.height
+                << std::endl;
+
+            save_snapshot_for_object(
+                object_name,
+                confidence);
+        }
+
+        /* ========================================================
+         * Crosswalk virtual line
+         * ========================================================
+         */
+
+        auto now =
+            std::chrono::steady_clock::now();
+
+        if (crosswalk_found &&
+            (!crosswalk_line_locked ||
+             now >= next_crosswalk_line_check))
+        {
+            int new_line_y =
+                static_cast<int>(
+                    crosswalk_y +
+                    (crosswalk_h *
+                     CROSSWALK_LINE_POSITION));
+
+            int frame_height =
+                frame_meta->source_frame_height;
+
+            if (frame_height > 0)
+            {
+                new_line_y =
+                    std::max(
+                        0,
+                        std::min(
+                            frame_height - 1,
+                            new_line_y));
+            }
+
+            crosswalk_line_y =
+                new_line_y;
+
+            crosswalk_line_locked =
+                true;
+
+            next_crosswalk_line_check =
+                now +
+                std::chrono::seconds(
+                    CROSSWALK_LINE_CHECK_SECONDS);
+
+            std::cout
+                << "[CROSSWALK LINE] "
+                << "New virtual line Y="
+                << crosswalk_line_y
+                << " locked for 120 seconds"
+                << std::endl;
+        }
+
+        /* Draw red line through DeepStream OSD */
+        if (crosswalk_line_locked)
+        {
+            NvDsDisplayMeta *display_meta =
+                nvds_acquire_display_meta_from_pool(
+                    batch_meta);
+
+            if (display_meta)
+            {
+                display_meta->num_lines = 1;
+
+                NvOSD_LineParams &line =
+                    display_meta->line_params[0];
+
+                line.x1 = 0;
+                line.y1 = crosswalk_line_y;
+
+                line.x2 =
+                    frame_meta->source_frame_width;
+
+                line.y2 =
+                    crosswalk_line_y;
+
+                line.line_width = 5;
+
+                line.line_color.red = 1.0;
+                line.line_color.green = 0.0;
+                line.line_color.blue = 0.0;
+                line.line_color.alpha = 1.0;
+
+                nvds_add_display_meta_to_frame(
+                    frame_meta,
+                    display_meta);
+            }
+        }
+    }
+
+    return GST_PAD_PROBE_OK;
+}
+
+
+/*
+ * ============================================================
+ * nvurisrcbin dynamic pad -> streammux sink_0
+ * ============================================================
+ */
+
+static void on_pad_added(
+    GstElement *,
+    GstPad *new_pad,
+    gpointer user_data)
+{
+    GstElement *streammux =
+        GST_ELEMENT(user_data);
+
+    GstCaps *caps =
+        gst_pad_get_current_caps(new_pad);
+
+    if (!caps)
+        caps =
+            gst_pad_query_caps(
+                new_pad,
+                nullptr);
+
+    if (!caps)
+        return;
+
+    GstStructure *structure =
+        gst_caps_get_structure(caps, 0);
+
+    const gchar *name =
+        gst_structure_get_name(structure);
+
+    std::cout
+        << "nvurisrcbin pad added: "
+        << name
+        << std::endl;
+
+    if (!g_str_has_prefix(
+            name,
+            "video/"))
+    {
+        gst_caps_unref(caps);
+        return;
+    }
+
+    GstPad *sink_pad =
+        gst_element_request_pad_simple(
+            streammux,
+            "sink_0");
+
+    if (!sink_pad)
+    {
+        std::cerr
+            << "ERROR: Cannot get "
+               "nvstreammux sink_0"
+            << std::endl;
+
+        gst_caps_unref(caps);
+        return;
+    }
+
+    if (gst_pad_is_linked(sink_pad))
+    {
+        gst_object_unref(sink_pad);
+        gst_caps_unref(caps);
+        return;
+    }
+
+    GstPadLinkReturn ret =
+        gst_pad_link(
+            new_pad,
+            sink_pad);
+
+    if (ret == GST_PAD_LINK_OK)
+    {
+        std::cout
+            << "Video linked to nvstreammux."
+            << std::endl;
+    }
+    else
+    {
+        std::cerr
+            << "ERROR: Failed to link video "
+               "to nvstreammux. Return="
+            << ret
+            << std::endl;
+    }
+
+    gst_object_unref(sink_pad);
+    gst_caps_unref(caps);
+}
+
+
+/*
+ * ============================================================
+ * Bus callback
+ * ============================================================
+ */
+
+static gboolean bus_callback(
+    GstBus *,
+    GstMessage *message,
+    gpointer user_data)
+{
+    GMainLoop *loop =
+        static_cast<GMainLoop *>(user_data);
+
+    switch (GST_MESSAGE_TYPE(message))
+    {
+        case GST_MESSAGE_ERROR:
+        {
+            GError *error = nullptr;
+            gchar *debug = nullptr;
+
+            gst_message_parse_error(
+                message,
+                &error,
+                &debug);
+
+            std::cerr
+                << "\nGStreamer ERROR from "
+                << GST_OBJECT_NAME(message->src)
+                << ": "
+                << error->message
+                << std::endl;
+
+            if (debug)
+            {
+                std::cerr
+                    << "Debug: "
+                    << debug
+                    << std::endl;
+            }
+
+            g_error_free(error);
+            g_free(debug);
+
+            g_main_loop_quit(loop);
+
+            break;
+        }
+
+        case GST_MESSAGE_WARNING:
+        {
+            GError *error = nullptr;
+            gchar *debug = nullptr;
+
+            gst_message_parse_warning(
+                message,
+                &error,
+                &debug);
+
+            std::cerr
+                << "\nGStreamer WARNING from "
+                << GST_OBJECT_NAME(message->src)
+                << ": "
+                << error->message
+                << std::endl;
+
+            if (debug)
+            {
+                std::cerr
+                    << "Debug: "
+                    << debug
+                    << std::endl;
+            }
+
+            g_error_free(error);
+            g_free(debug);
+
+            break;
+        }
+
+        case GST_MESSAGE_EOS:
+        {
+            std::cout
+                << "\nEOS received."
+                << std::endl;
+
+            g_main_loop_quit(loop);
+
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    return G_SOURCE_CONTINUE;
+}
+
+
+static gboolean stop_pipeline(
+    gpointer user_data)
+{
+    g_main_loop_quit(
+        static_cast<GMainLoop *>(user_data));
+
+    return G_SOURCE_REMOVE;
+}
+
+
+/*
+ * ============================================================
+ * Tee helper
+ * ============================================================
+ */
+
+static bool link_tee_branch(
+    GstElement *tee,
+    GstElement *target,
+    const char *branch_name)
+{
+    GstPad *tee_src =
+        gst_element_request_pad_simple(
+            tee,
+            "src_%u");
+
+    GstPad *sink_pad =
+        gst_element_get_static_pad(
+            target,
+            "sink");
+
+    if (!tee_src || !sink_pad)
+    {
+        g_printerr(
+            "Failed to get pads for tee branch: %s\n",
+            branch_name);
+
+        if (tee_src)
+            gst_object_unref(tee_src);
+
+        if (sink_pad)
+            gst_object_unref(sink_pad);
+
+        return false;
+    }
+
+    bool ok =
+        (gst_pad_link(
+            tee_src,
+            sink_pad)
+         == GST_PAD_LINK_OK);
+
+    if (!ok)
+    {
+        g_printerr(
+            "Failed to link tee -> %s\n",
+            branch_name);
+    }
+
+    gst_object_unref(tee_src);
+    gst_object_unref(sink_pad);
+
+    return ok;
+}
+
+
+/*
+ * ============================================================
+ * MAIN
+ * ============================================================
+ */
+
+int main(int argc, char *argv[])
+{
+    /*
+     * ========================================================
+     * NEW:
+     * Get RTSP URL from cameras.json
+     *
+     * No RTSP URL is accepted from command line anymore.
+     * ========================================================
+     */
+
+    std::string rtsp_url_string =
+        get_rtsp_url_from_json();
+
+    if (rtsp_url_string.empty())
+    {
+        std::cerr
+            << "ERROR: No valid RTSP stream available."
+            << std::endl;
+
+        return 1;
+    }
+
+    const gchar *rtsp_url =
+        rtsp_url_string.c_str();
+
+
+    gst_init(&argc, &argv);
+
+
+    if (g_mkdir_with_parents(
+            SNAPSHOT_DIR,
+            0755) == 0)
+    {
+        g_print(
+            "Snapshot directory ready: %s\n",
+            SNAPSHOT_DIR);
+    }
+    else
+    {
+        g_printerr(
+            "Warning: could not create snapshot directory: %s\n",
+            SNAPSHOT_DIR);
+    }
+
+
+    if (g_mkdir_with_parents(
+            EVENT_DIR,
+            0755) == 0)
+    {
+        g_print(
+            "Detection event directory ready: %s\n",
+            EVENT_DIR);
+    }
+    else
+    {
+        g_printerr(
+            "Warning: could not create event directory: %s\n",
+            EVENT_DIR);
+    }
+
+
+    main_loop =
+        g_main_loop_new(
+            nullptr,
+            FALSE);
+
+
+    GstElement *pipeline =
+        gst_pipeline_new(
+            "yolo26-merged-pipeline");
+
+
+    /* Core chain */
+
+    GstElement *source =
+        gst_element_factory_make(
+            "nvurisrcbin",
+            "camera-source");
+
+    GstElement *streammux =
+        gst_element_factory_make(
+            "nvstreammux",
+            "stream-muxer");
+
+    GstElement *infer =
+        gst_element_factory_make(
+            "nvinfer",
+            "yolo26-inference");
+
+    GstElement *osd =
+        gst_element_factory_make(
+            "nvdsosd",
+            "shared-osd");
+
+    GstElement *tee =
+        gst_element_factory_make(
+            "tee",
+            "infer-tee");
+
+
+    /* Branch A: detection-only sink */
+
+    GstElement *detect_queue =
+        gst_element_factory_make(
+            "queue",
+            "detect-queue");
+
+    GstElement *fake_sink =
+        gst_element_factory_make(
+            "fakesink",
+            "detect-sink");
+
+
+    /* Branch B: snapshot */
+
+    GstElement *snapshot_queue =
+        gst_element_factory_make(
+            "queue",
+            "snapshot-queue");
+
+    GstElement *converter =
+        gst_element_factory_make(
+            "nvvideoconvert",
+            "snapshot-converter");
+
+    GstElement *snapshot_capsfilter =
+        gst_element_factory_make(
+            "capsfilter",
+            "snapshot-caps");
+
+    GstElement *jpegenc =
+        gst_element_factory_make(
+            "nvjpegenc",
+            "snapshot-jpegenc");
+
+    GstElement *appsink_element =
+        gst_element_factory_make(
+            "appsink",
+            "snapshot-appsink");
+
+
+    /* Branch C: live RTSP re-stream */
+
+    GstElement *rtsp_queue =
+        gst_element_factory_make(
+            "queue",
+            "rtsp-queue");
+
+    GstElement *rtsp_sink =
+        gst_element_factory_make(
+            "nvrtspoutsinkbin",
+            "rtsp-output");
+
+
+    if (!pipeline ||
+        !source ||
+        !streammux ||
+        !infer ||
+        !osd ||
+        !tee ||
+        !detect_queue ||
+        !fake_sink ||
+        !snapshot_queue ||
+        !converter ||
+        !snapshot_capsfilter ||
+        !jpegenc ||
+        !appsink_element ||
+        !rtsp_queue ||
+        !rtsp_sink)
+    {
+        std::cerr
+            << "ERROR: Failed to create one or more "
+               "GStreamer/DeepStream elements."
+            << std::endl;
+
+        if (pipeline)
+            gst_object_unref(pipeline);
+
+        g_main_loop_unref(main_loop);
+
+        return 1;
+    }
+
+
+    /* --- Properties --- */
+
+    g_object_set(
+        G_OBJECT(source),
+        "uri",
+        rtsp_url,
+        "latency",
+        200,
+        nullptr);
+
+
+    g_object_set(
+        G_OBJECT(streammux),
+        "batch-size",
+        1,
+        "width",
+        1920,
+        "height",
+        1080,
+        "live-source",
+        TRUE,
+        "batched-push-timeout",
+        40000,
+        nullptr);
+
+
+    g_object_set(
+        G_OBJECT(infer),
+        "config-file-path",
+        DEEPSTREAM_CONFIG,
+        nullptr);
+
+
+    g_object_set(
+        G_OBJECT(osd),
+        "process-mode",
+        1,
+        "display-bbox",
+        TRUE,
+        "display-text",
+        TRUE,
+        nullptr);
+
+
+    g_object_set(
+        G_OBJECT(appsink_element),
+        "emit-signals",
+        TRUE,
+        "sync",
+        FALSE,
+        "max-buffers",
+        1,
+        "drop",
+        TRUE,
+        nullptr);
+
+
+    GstCaps *snapshot_caps =
+        gst_caps_from_string(
+            "video/x-raw(memory:NVMM),"
+            "format=NV12,"
+            "width=1280,"
+            "height=720");
+
+    if (!snapshot_caps)
+    {
+        std::cerr
+            << "ERROR: Failed to create snapshot caps."
+            << std::endl;
+
+        gst_object_unref(pipeline);
+        g_main_loop_unref(main_loop);
+
+        return 1;
+    }
+
+
+    g_object_set(
+        G_OBJECT(snapshot_capsfilter),
+        "caps",
+        snapshot_caps,
+        nullptr);
+
+    gst_caps_unref(snapshot_caps);
+
+
+    g_object_set(
+        G_OBJECT(rtsp_sink),
+        "idrinterval",
+        30,
+        "iframeinterval",
+        30,
+        nullptr);
+
+
+    /* --- Add everything to pipeline --- */
+
+    gst_bin_add_many(
+        GST_BIN(pipeline),
+
+        source,
+        streammux,
+        infer,
+        osd,
+        tee,
+
+        detect_queue,
+        fake_sink,
+
+        snapshot_queue,
+        converter,
+        snapshot_capsfilter,
+        jpegenc,
+        appsink_element,
+
+        rtsp_queue,
+        rtsp_sink,
+
+        nullptr);
+
+
+    /* --- Static links --- */
+
+    if (!gst_element_link(
+            streammux,
+            infer) ||
+
+        !gst_element_link_many(
+            infer,
+            osd,
+            tee,
+            nullptr))
+    {
+        std::cerr
+            << "ERROR: Failed to link "
+               "streammux -> nvinfer -> "
+               "nvdsosd -> tee."
+            << std::endl;
+
+        gst_object_unref(pipeline);
+        g_main_loop_unref(main_loop);
+
+        return 1;
+    }
+
+
+    if (!gst_element_link_many(
+            detect_queue,
+            fake_sink,
+            nullptr))
+    {
+        std::cerr
+            << "ERROR: Failed to link "
+               "detection branch."
+            << std::endl;
+
+        gst_object_unref(pipeline);
+        g_main_loop_unref(main_loop);
+
+        return 1;
+    }
+
+
+    if (!gst_element_link_many(
+            snapshot_queue,
+            converter,
+            snapshot_capsfilter,
+            jpegenc,
+            appsink_element,
+            nullptr))
+    {
+        std::cerr
+            << "ERROR: Failed to link "
+               "snapshot branch."
+            << std::endl;
+
+        gst_object_unref(pipeline);
+        g_main_loop_unref(main_loop);
+
+        return 1;
+    }
+
+
+    /* rtsp_queue -> nvrtspoutsinkbin */
+
+    {
+        GstPad *rtsp_sink_pad =
+            gst_element_request_pad_simple(
+                rtsp_sink,
+                "vsink");
+
+        GstPad *queue_src_pad =
+            gst_element_get_static_pad(
+                rtsp_queue,
+                "src");
+
+        if (!rtsp_sink_pad ||
+            !queue_src_pad ||
+            gst_pad_link(
+                queue_src_pad,
+                rtsp_sink_pad)
+                != GST_PAD_LINK_OK)
+        {
+            std::cerr
+                << "ERROR: Failed to link "
+                   "rtsp-queue -> "
+                   "nvrtspoutsinkbin."
+                << std::endl;
+
+            if (rtsp_sink_pad)
+                gst_object_unref(
+                    rtsp_sink_pad);
+
+            if (queue_src_pad)
+                gst_object_unref(
+                    queue_src_pad);
+
+            gst_object_unref(pipeline);
+            g_main_loop_unref(main_loop);
+
+            return 1;
+        }
+
+        gst_object_unref(rtsp_sink_pad);
+        gst_object_unref(queue_src_pad);
+    }
+
+
+    /* --- Tee: request 3 src pads --- */
+
+    if (!link_tee_branch(
+            tee,
+            detect_queue,
+            "detection queue") ||
+
+        !link_tee_branch(
+            tee,
+            snapshot_queue,
+            "snapshot queue") ||
+
+        !link_tee_branch(
+            tee,
+            rtsp_queue,
+            "rtsp queue"))
+    {
+        gst_object_unref(pipeline);
+        g_main_loop_unref(main_loop);
+
+        return 1;
+    }
+
+
+    /* --- Dynamic source pad --- */
+
+    g_signal_connect(
+        source,
+        "pad-added",
+        G_CALLBACK(on_pad_added),
+        streammux);
+
+
+    /* --- Stage 1: Crosswalk best.engine probe --- */
+
+    GstPad *osd_sink =
+        gst_element_get_static_pad(
+            osd,
+            "sink");
+
+    if (!osd_sink)
+    {
+        std::cerr
+            << "ERROR: Failed to get "
+               "shared nvdsosd sink pad."
+            << std::endl;
+
+        gst_object_unref(pipeline);
+        g_main_loop_unref(main_loop);
+
+        return 1;
+    }
+
+    std::cout
+        << "ADDING_CROSSWALK_BEST_PROBE osd_sink="
+        << osd_sink
+        << std::endl;
+
+    gst_pad_add_probe(
+        osd_sink,
+        GST_PAD_PROBE_TYPE_BUFFER,
+        crosswalk_best_engine_probe,
+        nullptr,
+        nullptr);
+
+    gst_object_unref(osd_sink);
+
+
+    /* --- Detection probe --- */
+
+    GstPad *osd_src =
+        gst_element_get_static_pad(
+            osd,
+            "src");
+
+    if (!osd_src)
+    {
+        std::cerr
+            << "ERROR: Failed to get "
+               "shared nvdsosd src pad."
+            << std::endl;
+
+        gst_object_unref(pipeline);
+        g_main_loop_unref(main_loop);
+
+        return 1;
+    }
+
+
+    std::cout << "ADDING_INFER_PROBE osd_src=" << osd_src << std::endl;
+    gst_pad_add_probe(
+        osd_src,
+        GST_PAD_PROBE_TYPE_BUFFER,
+        infer_src_probe,
+        nullptr,
+        nullptr);
+
+    gst_object_unref(osd_src);
+
+
+    /* --- appsink callback --- */
+
+    g_signal_connect(
+        GST_APP_SINK(appsink_element),
+        "new-sample",
+        G_CALLBACK(on_new_sample),
+        nullptr);
+
+
+    /* --- Bus --- */
+
+    GstBus *bus =
+        gst_element_get_bus(pipeline);
+
+    gst_bus_add_watch(
+        bus,
+        bus_callback,
+        main_loop);
+
+    gst_object_unref(bus);
+
+
+    /* --- Ctrl+C --- */
+
+    g_unix_signal_add(
+        SIGINT,
+        stop_pipeline,
+        main_loop);
+
+
+    /* --- Print configuration --- */
+
+    g_print(
+        "\n========================================\n");
+
+    g_print(
+        " YOLO26 MERGED PIPELINE\n");
+
+    g_print(
+        " CAMERA JSON: %s\n",
+        CAMERA_JSON_FILE);
+
+    g_print(
+        " RTSP INPUT:  %s\n",
+        rtsp_url);
+
+    g_print(
+        " RTSP OUTPUT: %s\n",
+        RTSP_OUTPUT_URL_HINT);
+
+    g_print(
+        " DeepStream config: %s\n",
+        DEEPSTREAM_CONFIG);
+
+    g_print(
+        " Snapshot directory: %s\n",
+        SNAPSHOT_DIR);
+
+    g_print(
+        " Event directory: %s\n",
+        EVENT_DIR);
+
+    g_print(
+        " Snapshot cooldown: %d seconds\n",
+        SNAPSHOT_COOLDOWN_SECONDS);
+
+    g_print(
+        " Branches: detection-only | "
+        "snapshot+event | live RTSP out\n");
+
+    g_print(
+        "========================================\n\n");
+
+
+    /* --- Initialize best.engine --- */
+
+    if (!g_best_detector.initialize())
+    {
+        std::cerr
+            << "ERROR: Failed to initialize best.engine."
+            << std::endl;
+
+        gst_element_set_state(
+            pipeline,
+            GST_STATE_NULL);
+
+        gst_object_unref(pipeline);
+        g_main_loop_unref(main_loop);
+
+        return 1;
+    }
+
+    std::cout
+        << "[BEST ENGINE] Initialized successfully."
+        << std::endl;
+
+
+    /* --- Start pipeline --- */
+
+    GstStateChangeReturn state =
+        gst_element_set_state(
+            pipeline,
+            GST_STATE_PLAYING);
+
+    if (state == GST_STATE_CHANGE_FAILURE)
+    {
+        std::cerr
+            << "ERROR: Failed to start pipeline."
+            << std::endl;
+
+        gst_element_set_state(
+            pipeline,
+            GST_STATE_NULL);
+
+        gst_object_unref(pipeline);
+        g_main_loop_unref(main_loop);
+
+        return 1;
+    }
+
+
+    g_main_loop_run(main_loop);
+
+
+    /* --- Cleanup --- */
+
+    gst_element_set_state(
+        pipeline,
+        GST_STATE_NULL);
+
+    gst_object_unref(pipeline);
+
+    g_main_loop_unref(main_loop);
+
+    std::cout
+        << "Pipeline stopped."
+        << std::endl;
+
+    return 0;
+}
